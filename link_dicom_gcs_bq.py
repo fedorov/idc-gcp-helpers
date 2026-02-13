@@ -141,6 +141,94 @@ _SKIP_FILENAMES = {
 }
 
 
+def _listing_table_id(output_table: str) -> str:
+    """Derive the listing table name from the output table name."""
+    return f"{output_table}__listing"
+
+
+def save_listing_to_bq(
+    gcs_client: storage.Client,
+    bucket_name: str,
+    prefix: str,
+    listing_table: str,
+    bq_client: bigquery.Client,
+    include_all: bool = False,
+    chunk_size: int = 10000,
+) -> list[str]:
+    """List blobs in GCS, stream paths to a BQ listing table in chunks.
+
+    Truncates the listing table on the first chunk, then appends subsequent
+    chunks. Returns the full list of gcs_path strings.
+    """
+    all_paths: list[str] = []
+    chunk: list[str] = []
+    first_chunk = True
+    chunks_flushed = 0
+
+    with tqdm(desc="Listing GCS files", unit=" files") as pbar:
+        for blob in gcs_client.list_blobs(bucket_name, prefix=prefix):
+            if blob.name.endswith("/"):
+                continue
+            if include_all or _is_likely_dicom(blob.name):
+                gcs_path = f"gs://{bucket_name}/{blob.name}"
+                all_paths.append(gcs_path)
+                chunk.append(gcs_path)
+                pbar.update(1)
+
+                if len(chunk) >= chunk_size:
+                    chunks_flushed += 1
+                    pbar.set_postfix(bq_chunks=chunks_flushed)
+                    _flush_listing_chunk(
+                        chunk, listing_table, bq_client, truncate=first_chunk,
+                    )
+                    first_chunk = False
+                    chunk = []
+
+    # Flush remaining
+    if chunk:
+        _flush_listing_chunk(
+            chunk, listing_table, bq_client, truncate=first_chunk,
+        )
+
+    return all_paths
+
+
+def _flush_listing_chunk(
+    paths: list[str],
+    listing_table: str,
+    bq_client: bigquery.Client,
+    truncate: bool = False,
+) -> None:
+    """Write a chunk of gcs_path values to the listing table."""
+    t0 = time.monotonic()
+    df = pd.DataFrame({"gcs_path": paths})
+    disposition = (
+        bigquery.WriteDisposition.WRITE_TRUNCATE if truncate
+        else bigquery.WriteDisposition.WRITE_APPEND
+    )
+    job_config = bigquery.LoadJobConfig(write_disposition=disposition)
+    load_job = bq_client.load_table_from_dataframe(
+        df, listing_table, job_config=job_config,
+    )
+    load_job.result()
+    perf.record("bq_flush_listing", time.monotonic() - t0)
+
+
+def load_listing_from_bq(
+    listing_table: str,
+    bq_client: bigquery.Client,
+) -> list[str] | None:
+    """Load the cached GCS file listing from BQ. Returns None if table doesn't exist."""
+    try:
+        bq_client.get_table(listing_table)
+    except Exception:
+        return None
+
+    sql = f"SELECT gcs_path FROM `{listing_table}`"
+    df = bq_client.query(sql).to_dataframe()
+    return list(df["gcs_path"])
+
+
 def _is_likely_dicom(name: str) -> bool:
     """Return True if the file is likely DICOM (.dcm or no extension)."""
     basename = os.path.basename(name)
@@ -403,6 +491,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Process all files, not just .dcm and extensionless",
     )
     parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force re-listing files from GCS even if a cached listing exists "
+             "in BigQuery. Use when new files have been added to the bucket.",
+    )
+    parser.add_argument(
+        "--listing-chunk-size",
+        type=int,
+        default=10000,
+        help="Number of GCS paths to flush to the listing table at a time "
+             "(default: 10000)",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable debug logging",
@@ -432,37 +533,70 @@ def main() -> None:
         # --- Step 1: Parse GCS URL ---
         bucket_name, prefix = parse_gcs_url(args.gcs_url)
 
-        # --- Step 2: List blobs ---
-        perf.begin("gcs_list_blobs")
+        # --- Step 2: Get file listing (cached BQ or fresh GCS) ---
         gcs_client = storage.Client()
         bq_client = bigquery.Client()
-        blobs = list_dicom_blobs(gcs_client, bucket_name, prefix, args.include_all_files)
-        total_files = len(blobs)
+        use_bq = args.output_mode == "bq" and args.output_path
+        listing_table = _listing_table_id(args.output_path) if use_bq else None
 
+        gcs_paths: list[str] | None = None
+
+        if use_bq and not args.refresh:
+            perf.begin("bq_load_listing")
+            cached = load_listing_from_bq(listing_table, bq_client)
+            if cached is not None:
+                gcs_paths = cached
+                print(
+                    f"Loaded {len(gcs_paths):,} paths from cached listing "
+                    f"({listing_table})",
+                    file=sys.stderr,
+                )
+
+        if gcs_paths is None:
+            # List from GCS (first run or --refresh)
+            perf.begin("gcs_list_blobs")
+            if use_bq:
+                gcs_paths = save_listing_to_bq(
+                    gcs_client, bucket_name, prefix, listing_table,
+                    bq_client, args.include_all_files, args.listing_chunk_size,
+                )
+                print(
+                    f"Saved {len(gcs_paths):,} paths to listing table "
+                    f"({listing_table})",
+                    file=sys.stderr,
+                )
+            else:
+                blobs = list_dicom_blobs(
+                    gcs_client, bucket_name, prefix, args.include_all_files,
+                )
+                gcs_paths = [f"gs://{b.bucket.name}/{b.name}" for b in blobs]
+
+        total_files = len(gcs_paths)
         if total_files == 0:
             print("No DICOM files found at the specified GCS path.", file=sys.stderr)
             sys.exit(0)
 
         # --- Step 2b: Skip already-processed files (incremental mode) ---
         perf.begin("bq_skip_check")
-        if args.output_mode == "bq" and args.output_path:
+        if use_bq:
             already_done = get_already_processed_paths(args.output_path, bq_client)
             if already_done:
-                before = len(blobs)
-                blobs = [
-                    b for b in blobs
-                    if f"gs://{b.bucket.name}/{b.name}" not in already_done
-                ]
-                skipped_existing = before - len(blobs)
+                before = len(gcs_paths)
+                gcs_paths = [p for p in gcs_paths if p not in already_done]
+                skipped_existing = before - len(gcs_paths)
                 print(
                     f"Skipping {skipped_existing:,} already-processed files "
                     f"(found in {args.output_path})",
                     file=sys.stderr,
                 )
 
-                if not blobs:
+                if not gcs_paths:
                     print("All files already processed. Nothing to do.", file=sys.stderr)
                     sys.exit(0)
+
+        # Convert gcs_paths to Blob objects for DICOM processing
+        bucket = gcs_client.bucket(bucket_name)
+        blobs = [bucket.blob(p.split(f"gs://{bucket_name}/", 1)[1]) for p in gcs_paths]
 
         # --- Step 3: Extract SOPInstanceUIDs (with chunked BQ writes) ---
         perf.begin("dicom_processing")
