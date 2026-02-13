@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+"""Link DICOM files in a GCS bucket to a BigQuery metadata table via SOPInstanceUID.
+
+Iterates over DICOM files in a GCS path, extracts SOPInstanceUID from each,
+then joins against a BigQuery table to confirm which ones are present.
+Outputs a table of (SOPInstanceUID, gcs_path).
+"""
+
+import argparse
+import logging
+import os
+import signal
+import sys
+import threading
+import time
+import uuid
+import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import BytesIO
+
+import pandas as pd
+import pydicom
+from google.cloud import bigquery, storage
+from tqdm import tqdm
+
+# Suppress noisy warnings from google-cloud-bigquery about optional dependencies
+warnings.filterwarnings("ignore", message=".*pandas-gbq.*")
+warnings.filterwarnings("ignore", message=".*BigQuery Storage module not found.*")
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Profiling
+# ---------------------------------------------------------------------------
+
+class PerfTracker:
+    """Lightweight wall-clock profiler that accumulates time per named phase."""
+
+    def __init__(self):
+        self.totals: dict[str, float] = {}
+        self.counts: dict[str, int] = {}
+        self.metadata: dict[str, object] = {}
+        self._current_phase: str | None = None
+        self._phase_start: float = 0.0
+        self.start_time: float = time.monotonic()
+        self._lock = threading.Lock()
+
+    def begin(self, phase: str) -> None:
+        self._end_current()
+        self._current_phase = phase
+        self._phase_start = time.monotonic()
+
+    def record(self, phase: str, elapsed: float) -> None:
+        """Thread-safe: record elapsed time for a phase (used from workers)."""
+        with self._lock:
+            self.totals[phase] = self.totals.get(phase, 0.0) + elapsed
+            self.counts[phase] = self.counts.get(phase, 0) + 1
+
+    def _end_current(self) -> None:
+        if self._current_phase is not None:
+            elapsed = time.monotonic() - self._phase_start
+            self.totals[self._current_phase] = (
+                self.totals.get(self._current_phase, 0.0) + elapsed
+            )
+            self.counts[self._current_phase] = (
+                self.counts.get(self._current_phase, 0) + 1
+            )
+            self._current_phase = None
+
+    def summary(self) -> str:
+        self._end_current()
+        wall = time.monotonic() - self.start_time
+        header = f"\nProfiling ({wall:.1f}s wall clock"
+        if "workers" in self.metadata:
+            header += f", {self.metadata['workers']} threads"
+        header += "):"
+        lines = [header]
+        for phase, total in sorted(self.totals.items(), key=lambda x: -x[1]):
+            count = self.counts[phase]
+            pct = total / wall * 100 if wall > 0 else 0
+            avg = total / count if count > 1 else total
+            line = f"  {phase:30s}  {total:8.1f}s  {pct:5.1f}%"
+            if count > 1:
+                line += f"  (n={count:,}, avg={avg:.3f}s)"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+perf = PerfTracker()
+
+
+def _sigint_handler(signum, frame):
+    """On Ctrl+C, print profiling summary and exit."""
+    print("\n\nInterrupted. Partial profiling results:", file=sys.stderr)
+    print(perf.summary(), file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# GCS helpers
+# ---------------------------------------------------------------------------
+
+def parse_gcs_url(gcs_url: str) -> tuple[str, str]:
+    """Parse 'gs://bucket/prefix/' into (bucket_name, prefix)."""
+    if not gcs_url.startswith("gs://"):
+        raise ValueError(f"Invalid GCS URL (must start with gs://): {gcs_url}")
+    path = gcs_url[len("gs://"):]
+    parts = path.split("/", 1)
+    bucket_name = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ""
+    # Ensure prefix ends with '/' so we don't match sibling folders
+    # e.g., "series_chunk_003" would also match "series_chunk_0031"
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    return bucket_name, prefix
+
+
+def list_dicom_blobs(
+    gcs_client: storage.Client,
+    bucket_name: str,
+    prefix: str,
+    include_all: bool = False,
+) -> list[storage.Blob]:
+    """List blobs under the GCS prefix, filtered to likely DICOM files."""
+    blobs = []
+    with tqdm(desc="Listing GCS files", unit=" files") as pbar:
+        for blob in gcs_client.list_blobs(bucket_name, prefix=prefix):
+            if blob.name.endswith("/"):
+                continue  # skip directory markers
+            if include_all or _is_likely_dicom(blob.name):
+                blobs.append(blob)
+                pbar.update(1)
+    return blobs
+
+
+_SKIP_FILENAMES = {
+    "license", "readme", "readme.md", "readme.txt", "changes", "changelog",
+    "changelog.md", "notice", "manifest", "manifest.txt", "metadata.json",
+    ".ds_store", "thumbs.db", "desktop.ini",
+}
+
+
+def _is_likely_dicom(name: str) -> bool:
+    """Return True if the file is likely DICOM (.dcm or no extension)."""
+    basename = os.path.basename(name)
+    if basename.lower() in _SKIP_FILENAMES:
+        return False
+    if basename.lower().endswith(".dcm"):
+        return True
+    # Files with no extension are common in DICOM
+    if "." not in basename:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# DICOM metadata extraction
+# ---------------------------------------------------------------------------
+
+_HEADER_SIZE = 16 * 1024  # 16KB — enough for DICOM header with SOPInstanceUID
+
+
+def extract_sop_uid_from_blob(blob: storage.Blob) -> tuple[str | None, str]:
+    """Download only the first 16KB of a blob and extract SOPInstanceUID.
+
+    SOPInstanceUID is in the DICOM file header, typically within the first
+    few KB. Downloading a partial range instead of streaming the whole file
+    drastically reduces network I/O.
+
+    Returns (sop_uid_or_none, gcs_path).
+    """
+    gcs_path = f"gs://{blob.bucket.name}/{blob.name}"
+    try:
+        t0 = time.monotonic()
+        header_bytes = blob.download_as_bytes(start=0, end=_HEADER_SIZE - 1)
+        t1 = time.monotonic()
+        ds = pydicom.dcmread(
+            BytesIO(header_bytes),
+            stop_before_pixels=True,
+            specific_tags=["SOPInstanceUID"],
+            force=True,
+        )
+        t2 = time.monotonic()
+        perf.record("gcs_download", t1 - t0)
+        perf.record("dicom_parse", t2 - t1)
+        sop_uid = getattr(ds, "SOPInstanceUID", None)
+        if sop_uid is not None:
+            return str(sop_uid), gcs_path
+        logger.debug("No SOPInstanceUID found in %s", gcs_path)
+        return None, gcs_path
+    except Exception as exc:
+        logger.debug("Failed to read %s: %s", gcs_path, exc)
+        return None, gcs_path
+
+
+# ---------------------------------------------------------------------------
+# BigQuery helpers
+# ---------------------------------------------------------------------------
+
+def flush_chunk_to_bq(
+    chunk: list[dict],
+    bq_table_id: str,
+    sop_column: str,
+    output_table: str,
+    bq_client: bigquery.Client,
+) -> int:
+    """Write all processed paths to the output table, join to count matches.
+
+    All paths (including failures with NULL SOPInstanceUID) are written so that
+    the incremental skip check can exclude them on restarts.
+
+    Returns the number of matched rows.
+    """
+    t0 = time.monotonic()
+    gcs_df = pd.DataFrame(chunk)
+
+    # Write all processed paths (successes and failures) for skip tracking
+    upload_to_bq(gcs_df, output_table, bq_client, append=True)
+
+    # Join only the rows that have a SOPInstanceUID to count matches
+    has_uid = gcs_df[gcs_df["SOPInstanceUID"].notna()]
+    matched = 0
+    if not has_uid.empty:
+        matched_df = join_with_bq_table(has_uid, bq_table_id, sop_column, bq_client)
+        matched = len(matched_df)
+
+    perf.record("bq_flush_chunk", time.monotonic() - t0)
+    return matched
+
+
+def join_with_bq_table(
+    gcs_df: pd.DataFrame,
+    bq_table_id: str,
+    sop_column: str,
+    bq_client: bigquery.Client,
+) -> pd.DataFrame:
+    """Upload gcs_df as a temp table, JOIN with the target table, return results."""
+    parts = bq_table_id.split(".")
+    if len(parts) != 3:
+        raise ValueError(
+            f"bq_table must be fully qualified as project.dataset.table, got: {bq_table_id}"
+        )
+    project, dataset, _ = parts
+    temp_table_id = f"{project}.{dataset}._temp_sop_lookup_{uuid.uuid4().hex[:8]}"
+
+    try:
+        # Upload temp table
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+        load_job = bq_client.load_table_from_dataframe(
+            gcs_df, temp_table_id, job_config=job_config,
+        )
+        load_job.result()  # wait for completion
+
+        # Run JOIN query
+        sql = f"""
+            SELECT t.{sop_column} AS SOPInstanceUID, g.gcs_path
+            FROM `{bq_table_id}` AS t
+            INNER JOIN `{temp_table_id}` AS g
+            ON t.{sop_column} = g.SOPInstanceUID
+        """
+        result_df = bq_client.query(sql).to_dataframe()
+        return result_df
+
+    except Exception as exc:
+        # If temp-table creation fails (e.g. permissions), fall back to local join
+        if "Access Denied" in str(exc) or "403" in str(exc):
+            logger.warning(
+                "Cannot create temp table (permission denied). "
+                "Falling back to local pandas join."
+            )
+            return _local_join_fallback(gcs_df, bq_table_id, sop_column, bq_client)
+        raise
+    finally:
+        # Clean up temp table
+        bq_client.delete_table(temp_table_id, not_found_ok=True)
+
+
+def _local_join_fallback(
+    gcs_df: pd.DataFrame,
+    bq_table_id: str,
+    sop_column: str,
+    bq_client: bigquery.Client,
+) -> pd.DataFrame:
+    """Fallback: download SOPInstanceUID column from BQ and join locally."""
+    print(f"Downloading {sop_column} column from {bq_table_id}...", file=sys.stderr)
+    sql = f"SELECT {sop_column} FROM `{bq_table_id}`"
+    bq_df = bq_client.query(sql).to_dataframe()
+    bq_df = bq_df.rename(columns={sop_column: "SOPInstanceUID"})
+    return pd.merge(gcs_df, bq_df, on="SOPInstanceUID", how="inner")
+
+
+def get_already_processed_paths(
+    output_table: str,
+    bq_client: bigquery.Client,
+) -> set[str]:
+    """Query the output BQ table for gcs_path values already processed.
+
+    Returns an empty set if the table does not exist.
+    """
+    try:
+        bq_client.get_table(output_table)
+    except Exception:
+        return set()
+
+    sql = f"SELECT gcs_path FROM `{output_table}`"
+    df = bq_client.query(sql).to_dataframe()
+    return set(df["gcs_path"])
+
+
+def upload_to_bq(
+    df: pd.DataFrame,
+    destination_table: str,
+    bq_client: bigquery.Client,
+    append: bool = False,
+) -> None:
+    """Upload a DataFrame to a BigQuery table."""
+    disposition = (
+        bigquery.WriteDisposition.WRITE_APPEND if append
+        else bigquery.WriteDisposition.WRITE_TRUNCATE
+    )
+    job_config = bigquery.LoadJobConfig(write_disposition=disposition)
+    load_job = bq_client.load_table_from_dataframe(
+        df, destination_table, job_config=job_config,
+    )
+    load_job.result()
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def write_results(
+    df: pd.DataFrame,
+    output_mode: str,
+    output_path: str | None,
+    bq_client: bigquery.Client | None = None,
+    append: bool = False,
+) -> None:
+    """Write the result DataFrame to the chosen destination."""
+    if output_mode == "csv":
+        df.to_csv(output_path, index=False)
+        print(f"  Output: {output_path}", file=sys.stderr)
+    elif output_mode == "bq":
+        upload_to_bq(df, output_path, bq_client, append=append)
+        action = "Appended to" if append else "Wrote to"
+        print(f"  Output: {action} BigQuery table {output_path}", file=sys.stderr)
+    else:  # stdout
+        print(df.to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Match DICOM SOPInstanceUIDs from a GCS path against a BigQuery table.",
+    )
+    parser.add_argument(
+        "gcs_url",
+        help="GCS path containing DICOM files (e.g. gs://bucket/path/to/dicoms/)",
+    )
+    parser.add_argument(
+        "bq_table",
+        help="Fully-qualified BigQuery table ID (e.g. project.dataset.table)",
+    )
+    parser.add_argument(
+        "--output-mode",
+        choices=["stdout", "csv", "bq"],
+        default="stdout",
+        help="How to output results (default: stdout)",
+    )
+    parser.add_argument(
+        "--output-path",
+        help="File path for CSV output, or BQ table ID for BQ output. "
+             "Required when --output-mode is csv or bq.",
+    )
+    parser.add_argument(
+        "--sop-column",
+        default="SOPInstanceUID",
+        help="Name of the SOPInstanceUID column in the BigQuery table (default: SOPInstanceUID)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of parallel threads for reading DICOM files (default: 8)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=5000,
+        help="When --output-mode=bq, flush results to BigQuery every N files "
+             "(default: 5000). Smaller values = more fault tolerance but more "
+             "BQ round-trips (~3-5s overhead each).",
+    )
+    parser.add_argument(
+        "--include-all-files",
+        action="store_true",
+        help="Process all files, not just .dcm and extensionless",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    # Validate arguments
+    if args.output_mode in ("csv", "bq") and not args.output_path:
+        parser.error(f"--output-path is required when --output-mode is {args.output_mode}")
+
+    # Set up logging
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(levelname)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+    perf.metadata["workers"] = args.workers
+
+    try:
+        # --- Step 1: Parse GCS URL ---
+        bucket_name, prefix = parse_gcs_url(args.gcs_url)
+
+        # --- Step 2: List blobs ---
+        perf.begin("gcs_list_blobs")
+        gcs_client = storage.Client()
+        bq_client = bigquery.Client()
+        blobs = list_dicom_blobs(gcs_client, bucket_name, prefix, args.include_all_files)
+        total_files = len(blobs)
+
+        if total_files == 0:
+            print("No DICOM files found at the specified GCS path.", file=sys.stderr)
+            sys.exit(0)
+
+        # --- Step 2b: Skip already-processed files (incremental mode) ---
+        perf.begin("bq_skip_check")
+        if args.output_mode == "bq" and args.output_path:
+            already_done = get_already_processed_paths(args.output_path, bq_client)
+            if already_done:
+                before = len(blobs)
+                blobs = [
+                    b for b in blobs
+                    if f"gs://{b.bucket.name}/{b.name}" not in already_done
+                ]
+                skipped_existing = before - len(blobs)
+                print(
+                    f"Skipping {skipped_existing:,} already-processed files "
+                    f"(found in {args.output_path})",
+                    file=sys.stderr,
+                )
+
+                if not blobs:
+                    print("All files already processed. Nothing to do.", file=sys.stderr)
+                    sys.exit(0)
+
+        # --- Step 3: Extract SOPInstanceUIDs (with chunked BQ writes) ---
+        perf.begin("dicom_processing")
+        use_chunked_bq = args.output_mode == "bq" and args.output_path
+        chunk_buffer = []
+        total_extracted = 0
+        total_matched = 0
+        total_errors = 0
+        chunks_flushed = 0
+
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(extract_sop_uid_from_blob, blob): blob
+                for blob in blobs
+            }
+            with tqdm(total=len(futures), desc="Processing DICOM files", unit=" files") as pbar:
+                for future in as_completed(futures):
+                    sop_uid, gcs_path = future.result()
+                    chunk_buffer.append({"SOPInstanceUID": sop_uid, "gcs_path": gcs_path})
+                    if sop_uid is not None:
+                        total_extracted += 1
+                    else:
+                        total_errors += 1
+                    pbar.update(1)
+
+                    # Flush chunk to BQ when buffer is full
+                    if use_chunked_bq and len(chunk_buffer) >= args.chunk_size:
+                        chunks_flushed += 1
+                        pbar.set_postfix(chunk=chunks_flushed, matched=total_matched)
+                        matched = flush_chunk_to_bq(
+                            chunk_buffer, args.bq_table, args.sop_column,
+                            args.output_path, bq_client,
+                        )
+                        total_matched += matched
+                        chunk_buffer = []
+
+        # Flush remaining buffer
+        if chunk_buffer:
+            if use_chunked_bq:
+                matched = flush_chunk_to_bq(
+                    chunk_buffer, args.bq_table, args.sop_column,
+                    args.output_path, bq_client,
+                )
+                total_matched += matched
+            # For non-BQ modes, do the join and output in one shot
+            elif total_extracted > 0:
+                gcs_df = pd.DataFrame(chunk_buffer)
+                has_uid = gcs_df[gcs_df["SOPInstanceUID"].notna()]
+                matched_df = join_with_bq_table(
+                    has_uid, args.bq_table, args.sop_column, bq_client,
+                )
+                total_matched = len(matched_df)
+                write_results(matched_df, args.output_mode, args.output_path, bq_client)
+
+        if total_extracted == 0:
+            print("No SOPInstanceUIDs could be extracted from any files.", file=sys.stderr)
+            sys.exit(0)
+
+        # --- Summary ---
+        skipped_msg = f" ({total_errors} skipped)" if total_errors else ""
+        print(f"\nDone.", file=sys.stderr)
+        print(f"  GCS files scanned:     {len(blobs):,}", file=sys.stderr)
+        print(f"  SOPInstanceUIDs found: {total_extracted:,}{skipped_msg}", file=sys.stderr)
+        print(f"  Matched in BigQuery:   {total_matched:,}", file=sys.stderr)
+        if use_chunked_bq:
+            print(f"  Output: BigQuery table {args.output_path}", file=sys.stderr)
+        print(perf.summary(), file=sys.stderr)
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted. Partial profiling results:", file=sys.stderr)
+        print(perf.summary(), file=sys.stderr)
+        sys.exit(1)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        if "DefaultCredentialsError" in type(exc).__name__ or "default credentials" in str(exc).lower():
+            print(
+                "Error: Google Cloud credentials not found.\n"
+                "Run: gcloud auth application-default login",
+                file=sys.stderr,
+            )
+        else:
+            logger.debug("Unhandled exception", exc_info=True)
+            print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
