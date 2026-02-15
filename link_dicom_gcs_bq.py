@@ -246,35 +246,62 @@ def _is_likely_dicom(name: str) -> bool:
 # DICOM metadata extraction
 # ---------------------------------------------------------------------------
 
-_HEADER_SIZE = 16 * 1024  # 16KB — enough for DICOM header with SOPInstanceUID
+_HEADER_SMALL = 1024       # 1KB — SOPInstanceUID (0008,0018) is typically
+                           # within the first ~700 bytes; this hits most files.
+_HEADER_LARGE = 16 * 1024  # 16KB — fallback for unusual files with extra
+                           # elements before SOPInstanceUID.
+
+
+def _try_parse_sop_uid(data: bytes) -> str | None:
+    """Try to extract SOPInstanceUID from a byte buffer."""
+    ds = pydicom.dcmread(
+        BytesIO(data),
+        stop_before_pixels=True,
+        specific_tags=["SOPInstanceUID"],
+        force=True,
+    )
+    sop_uid = getattr(ds, "SOPInstanceUID", None)
+    return str(sop_uid) if sop_uid is not None else None
 
 
 def extract_sop_uid_from_blob(blob: storage.Blob) -> tuple[str | None, str]:
-    """Download only the first 16KB of a blob and extract SOPInstanceUID.
+    """Extract SOPInstanceUID using adaptive partial downloads.
 
-    SOPInstanceUID is in the DICOM file header, typically within the first
-    few KB. Downloading a partial range instead of streaming the whole file
-    drastically reduces network I/O.
+    First tries a 1KB read (sufficient for most DICOM files). If
+    SOPInstanceUID isn't found, retries with 16KB. This minimizes
+    network I/O for the common case while still handling unusual files.
 
     Returns (sop_uid_or_none, gcs_path).
     """
     gcs_path = f"gs://{blob.bucket.name}/{blob.name}"
     try:
+        # First attempt: small read
         t0 = time.monotonic()
-        header_bytes = blob.download_as_bytes(start=0, end=_HEADER_SIZE - 1)
+        header_bytes = blob.download_as_bytes(start=0, end=_HEADER_SMALL - 1)
         t1 = time.monotonic()
-        ds = pydicom.dcmread(
-            BytesIO(header_bytes),
-            stop_before_pixels=True,
-            specific_tags=["SOPInstanceUID"],
-            force=True,
-        )
-        t2 = time.monotonic()
         perf.record("gcs_download", t1 - t0)
-        perf.record("dicom_parse", t2 - t1)
-        sop_uid = getattr(ds, "SOPInstanceUID", None)
+
+        t_parse = time.monotonic()
+        sop_uid = _try_parse_sop_uid(header_bytes)
+        perf.record("dicom_parse", time.monotonic() - t_parse)
+
         if sop_uid is not None:
-            return str(sop_uid), gcs_path
+            return sop_uid, gcs_path
+
+        # Fallback: larger read
+        t0 = time.monotonic()
+        header_bytes = blob.download_as_bytes(start=0, end=_HEADER_LARGE - 1)
+        t1 = time.monotonic()
+        perf.record("gcs_download", t1 - t0)
+        perf.record("gcs_download_retry", t1 - t0)
+
+        t_parse = time.monotonic()
+        sop_uid = _try_parse_sop_uid(header_bytes)
+        perf.record("dicom_parse", time.monotonic() - t_parse)
+
+        if sop_uid is not None:
+            return sop_uid, gcs_path
+
         logger.debug("No SOPInstanceUID found in %s", gcs_path)
         return None, gcs_path
     except Exception as exc:
